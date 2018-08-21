@@ -8,6 +8,7 @@ from collections import defaultdict
 from importlib import import_module
 from inspect import ArgSpec
 from keyword import iskeyword
+from enum import Enum as PyEnum
 
 import sqlalchemy
 import sqlalchemy.exc
@@ -166,8 +167,11 @@ class ModelTable(Model):
 class ModelClass(Model):
     parent_name = 'Base'
 
-    def __init__(self, table, association_tables, inflect_engine, detect_joined):
+    def __init__(self, table, association_tables, inflect_engine, detect_joined,
+                 class_name_fn, rel_name_fn):
         super(ModelClass, self).__init__(table)
+        self.class_name_fn = class_name_fn
+        self.rel_name_fn = rel_name_fn
         self.name = self._tablename_to_classname(table.name, inflect_engine)
         self.children = []
         self.attributes = OrderedDict()
@@ -187,7 +191,7 @@ class ModelClass(Model):
                     self.parent_name = target_cls
                 else:
                     relationship_ = ManyToOneRelationship(self.name, target_cls, constraint,
-                                                          inflect_engine)
+                                                          inflect_engine, self.rel_name_fn)
                     self._add_attribute(relationship_.preferred_name, relationship_)
 
         # Add many-to-many relationships
@@ -197,14 +201,21 @@ class ModelClass(Model):
             fk_constraints.sort(key=_get_constraint_sort_key)
             target_cls = self._tablename_to_classname(
                 fk_constraints[1].elements[0].column.table.name, inflect_engine)
-            relationship_ = ManyToManyRelationship(self.name, target_cls, association_table)
+            relationship_ = ManyToManyRelationship(self.name, target_cls,
+                                                   association_table, self.rel_name_fn)
             self._add_attribute(relationship_.preferred_name, relationship_)
 
-    @classmethod
-    def _tablename_to_classname(cls, tablename, inflect_engine):
-        tablename = cls._convert_to_valid_identifier(tablename)
-        camel_case_name = ''.join(part[:1].upper() + part[1:] for part in tablename.split('_'))
-        return inflect_engine.singular_noun(camel_case_name) or camel_case_name
+    def _tablename_to_classname(self, tablename, inflect_engine):
+        class_name = None
+        if self.class_name_fn:
+            class_name = self.class_name_fn(tablename)
+
+        if class_name is None:
+            tablename = self._convert_to_valid_identifier(tablename)
+            camel_case_name = ''.join(part[:1].upper() + part[1:] for part in tablename.split('_'))
+            class_name = inflect_engine.singular_noun(camel_case_name) or camel_case_name
+
+        return class_name
 
     @staticmethod
     def _convert_to_valid_identifier(name):
@@ -232,8 +243,20 @@ class ModelClass(Model):
         if any(isinstance(value, Relationship) for value in self.attributes.values()):
             collector.add_literal_import('sqlalchemy.orm', 'relationship')
 
+        if any(isinstance(value, ManyToOneRelationship)
+               and value.is_one_to_one
+               and 'backref' in value.kwargs
+               for value in self.attributes.values()):
+            collector.add_literal_import('sqlalchemy.orm', 'backref')
+
         for child in self.children:
             child.add_imports(collector)
+
+
+class RelationshipType(PyEnum):
+    ONE_TO_ONE = "ONE_TO_ONE"
+    MANY_TO_ONE = "MANY_TO_ONE"
+    MANY_TO_MANY = "MANY_TO_MANY"
 
 
 class Relationship(object):
@@ -245,7 +268,7 @@ class Relationship(object):
 
 
 class ManyToOneRelationship(Relationship):
-    def __init__(self, source_cls, target_cls, constraint, inflect_engine):
+    def __init__(self, source_cls, target_cls, constraint, inflect_engine, rel_name_fn):
         super(ManyToOneRelationship, self).__init__(source_cls, target_cls)
 
         column_names = _get_column_names(constraint)
@@ -257,16 +280,33 @@ class ManyToOneRelationship(Relationship):
             self.preferred_name = colname[:-3]
 
         # Add uselist=False to One-to-One relationships
+        self.relationship_type = RelationshipType.MANY_TO_ONE
         if any(isinstance(c, (PrimaryKeyConstraint, UniqueConstraint)) and
                set(col.name for col in c.columns) == set(column_names)
                for c in constraint.table.constraints):
             self.kwargs['uselist'] = 'False'
+            self.relationship_type = RelationshipType.ONE_TO_ONE
 
         # Handle self referential relationships
         if source_cls == target_cls:
             self.preferred_name = 'parent' if not colname.endswith('_id') else colname[:-3]
             pk_col_names = [col.name for col in constraint.table.primary_key]
             self.kwargs['remote_side'] = '[{0}]'.format(', '.join(pk_col_names))
+
+        # if there's a custom relationship name, use that
+        if rel_name_fn is not None:
+            rel_and_backref_name = rel_name_fn(constraint, self.relationship_type)
+            if rel_and_backref_name is not None:
+                rel_name, backref_name = rel_and_backref_name
+                if rel_name is not None:
+                    self.preferred_name = rel_name
+                if backref_name is not None:
+                    if self.is_one_to_one:
+                        backref_arg = "backref('{}', uselist=False)".format(backref_name)
+                    else:
+                        backref_arg = "'{}'".format(backref_name)
+
+                    self.kwargs['backref'] = backref_arg
 
         # If the two tables share more than one foreign key constraint,
         # SQLAlchemy needs an explicit primaryjoin to figure out which column(s) to join with
@@ -275,6 +315,10 @@ class ManyToOneRelationship(Relationship):
         if len(common_fk_constraints) > 1:
             self.kwargs['primaryjoin'] = "'{0}.{1} == {2}.{3}'".format(
                 source_cls, column_names[0], target_cls, constraint.elements[0].column.name)
+
+    @property
+    def is_one_to_one(self):
+        return self.relationship_type == RelationshipType.ONE_TO_ONE
 
     @staticmethod
     def get_common_fk_constraints(table1, table2):
@@ -287,7 +331,7 @@ class ManyToOneRelationship(Relationship):
 
 
 class ManyToManyRelationship(Relationship):
-    def __init__(self, source_cls, target_cls, assocation_table):
+    def __init__(self, source_cls, target_cls, assocation_table, rel_name_fn):
         super(ManyToManyRelationship, self).__init__(source_cls, target_cls)
 
         prefix = (assocation_table.schema + '.') if assocation_table.schema else ''
@@ -317,6 +361,16 @@ class ManyToManyRelationship(Relationship):
                 repr('and_({0})'.format(', '.join(sec_joins)))
                 if len(sec_joins) > 1 else repr(sec_joins[0]))
 
+        # if there's a custom relationship name, use that
+        if rel_name_fn is not None:
+            rel_and_backref_name = rel_name_fn(constraints[1], RelationshipType.MANY_TO_MANY)
+            if rel_and_backref_name is not None:
+                rel_name, backref_name = rel_and_backref_name
+                if rel_name is not None:
+                    self.preferred_name = rel_name
+                if backref_name is not None:
+                    self.kwargs['backref'] = "'{}'".format(backref_name)
+
 
 class CodeGenerator(object):
     template = """\
@@ -331,7 +385,8 @@ class CodeGenerator(object):
     def __init__(self, metadata, noindexes=False, noconstraints=False, nojoined=False,
                  noinflect=False, noclasses=False, indentation='    ', model_separator='\n\n',
                  ignored_tables=('alembic_version', 'migrate_version'), table_model=ModelTable,
-                 class_model=ModelClass,  template=None):
+                 class_model=ModelClass, template=None, base_import=None, class_name_fn=None,
+                 rel_name_fn=None):
         super(CodeGenerator, self).__init__()
         self.metadata = metadata
         self.noindexes = noindexes
@@ -347,6 +402,10 @@ class CodeGenerator(object):
         if template:
             self.template = template
         self.inflect_engine = self.create_inflect_engine()
+        self.using_declarative = True
+        self.base_import = base_import
+        self.class_name_fn = class_name_fn
+        self.rel_name_fn = rel_name_fn
 
         # Pick association tables from the metadata into their own set, don't process them normally
         links = defaultdict(lambda: [])
@@ -413,7 +472,7 @@ class CodeGenerator(object):
                 model = self.table_model(table)
             else:
                 model = self.class_model(table, links[table.name], self.inflect_engine,
-                                         not nojoined)
+                                         not nojoined, self.class_name_fn, self.rel_name_fn)
                 classes[model.name] = model
 
             self.models.append(model)
@@ -427,10 +486,14 @@ class CodeGenerator(object):
 
         # Add either the MetaData or declarative_base import depending on whether there are mapped
         # classes or not
-        if not any(isinstance(model, self.class_model) for model in self.models):
-            self.collector.add_literal_import('sqlalchemy', 'MetaData')
+        self.using_declarative = any(isinstance(model, self.class_model) for model in self.models)
+        if self.using_declarative:
+            if self.base_import is None:
+                self.collector.add_literal_import('sqlalchemy.ext.declarative', 'declarative_base')
+            else:
+                self.collector.add_literal_import(self.base_import, 'Base')
         else:
-            self.collector.add_literal_import('sqlalchemy.ext.declarative', 'declarative_base')
+            self.collector.add_literal_import('sqlalchemy', 'MetaData')
 
     def create_inflect_engine(self):
         if self.noinflect:
@@ -444,8 +507,11 @@ class CodeGenerator(object):
                          for package, names in self.collector.items())
 
     def render_metadata_declarations(self):
-        if 'sqlalchemy.ext.declarative' in self.collector:
-            return 'Base = declarative_base()\nmetadata = Base.metadata'
+        if self.using_declarative:
+            if self.base_import is None:
+                return 'Base = declarative_base()\nmetadata = Base.metadata'
+            else:
+                return 'metadata = Base.metadata'
         return 'metadata = MetaData()'
 
     def _get_compiled_expression(self, statement):
